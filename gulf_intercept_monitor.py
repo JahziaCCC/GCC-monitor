@@ -1,28 +1,25 @@
 import os
 import re
 import html
+import json
 import hashlib
 import feedparser
 import requests
-from datetime import datetime
+from datetime import datetime, timedelta
+from pathlib import Path
+
+# =========================
+# إعدادات
+# =========================
+START_DATE = datetime(2026, 2, 28)
+STATE_FILE = "gcc_db.json"
 
 BOT = os.environ.get("TELEGRAM_BOT_TOKEN")
 CHAT = os.environ.get("TELEGRAM_CHAT_ID")
 
-def send(msg):
-    if not BOT or not CHAT:
-        print(msg)
-        return
-
-    url = f"https://api.telegram.org/bot{BOT}/sendMessage"
-    payload = {
-        "chat_id": CHAT,
-        "text": msg
-    }
-    r = requests.post(url, json=payload, timeout=30)
-    print("Status:", r.status_code)
-    print("Response:", r.text)
-
+# =========================
+# الدول
+# =========================
 GULF = {
     "saudi": "🇸🇦 السعودية",
     "uae": "🇦🇪 الإمارات",
@@ -32,144 +29,127 @@ GULF = {
     "oman": "🇴🇲 عمان"
 }
 
-INTERCEPT = [
-    "intercept", "intercepted", "shot down", "destroyed", "downed",
-    "air defenses intercepted", "air defences intercepted",
-    "تم اعتراض", "اعترضت", "تم إسقاط", "اسقطت", "تم تدمير", "صد", "تم صد"
-]
+# =========================
+# كلمات
+# =========================
+INTERCEPT = ["intercept","shot down","destroyed","تم اعتراض","تم إسقاط","تم صد"]
+EXCLUDE = ["launched","detected","أطلقت","رصد"]
 
-EXCLUDE = [
-    "launched", "fired", "detected", "tracked",
-    "أطلقت", "إطلاق", "رصد", "تم رصد"
-]
-
-MISSILE = [
-    r'(\d+)\s+missiles?',
-    r'(\d+)\s+ballistic\s+missiles?',
-    r'(\d+)\s+rockets?',
-    r'(\d+)\s+صواريخ?',
-    r'(\d+)\s+صاروخ'
-]
-
-DRONE = [
-    r'(\d+)\s+drones?',
-    r'(\d+)\s+uavs?',
-    r'(\d+)\s+مسيّرات?',
-    r'(\d+)\s+مسيرات?',
-    r'(\d+)\s+طائرات?\s+مسيّرة',
-    r'(\d+)\s+طائرات?\s+مسيرة'
-]
+MISSILE = [r'(\d+)\s+missiles?', r'(\d+)\s+صواريخ?']
+DRONE = [r'(\d+)\s+drones?', r'(\d+)\s+مسي']
 
 RSS = [
     "https://news.google.com/rss/search?q=missiles+drones+intercept+gulf",
-    "https://news.google.com/rss/search?q=%D8%A7%D8%B9%D8%AA%D8%B1%D8%A7%D8%B6+%D8%B5%D9%88%D8%A7%D8%B1%D9%8A%D8%AE+%D9%85%D8%B3%D9%8A%D8%B1%D8%A7%D8%AA+%D8%A7%D9%84%D8%AE%D9%84%D9%8A%D8%AC"
+    "https://news.google.com/rss/search?q=اعتراض+صواريخ+مسيرات+الخليج"
 ]
+
+# =========================
+# أدوات
+# =========================
+def send(msg):
+    if not BOT or not CHAT:
+        print(msg)
+        return
+    requests.post(f"https://api.telegram.org/bot{BOT}/sendMessage",
+                  json={"chat_id": CHAT, "text": msg})
 
 def clean(t):
     t = html.unescape(t or "")
-    t = re.sub(r"<.*?>", " ", t)
-    t = re.sub(r"\s+", " ", t).strip()
-    return t
+    return re.sub(r"\s+"," ",re.sub(r"<.*?>"," ",t)).strip()
 
-def has_intercept(t):
+def detect_country(t):
     t = t.lower()
-    return any(k in t for k in INTERCEPT)
-
-def is_bad(t):
-    t = t.lower()
-    if has_intercept(t):
-        return False
-    return any(k in t for k in EXCLUDE)
-
-def country(t):
-    t = t.lower()
-    if "saudi" in t or "السعودية" in t:
-        return "saudi"
-    if "uae" in t or "emirates" in t or "الإمارات" in t or "الامارات" in t or "dubai" in t or "abu dhabi" in t:
-        return "uae"
-    if "qatar" in t or "قطر" in t:
-        return "qatar"
-    if "kuwait" in t or "الكويت" in t:
-        return "kuwait"
-    if "bahrain" in t or "البحرين" in t:
-        return "bahrain"
-    if "oman" in t or "عمان" in t:
-        return "oman"
-    return None
+    if "saudi" in t or "السعودية" in t: return "saudi"
+    if "uae" in t or "الإمارات" in t: return "uae"
+    if "qatar" in t or "قطر" in t: return "qatar"
+    if "kuwait" in t or "الكويت" in t: return "kuwait"
+    if "bahrain" in t or "البحرين" in t: return "bahrain"
+    if "oman" in t or "عمان" in t: return "oman"
 
 def extract(t):
-    t = t.lower()
-    m = 0
-    d = 0
+    t=t.lower()
+    m=d=0
+    for p in MISSILE: m+=sum(map(int,re.findall(p,t)))
+    for p in DRONE: d+=sum(map(int,re.findall(p,t)))
+    return m,d
 
-    for p in MISSILE:
-        vals = re.findall(p, t)
-        m += sum(int(x) for x in vals if str(x).isdigit())
+def load():
+    if not Path(STATE_FILE).exists():
+        return []
+    return json.loads(Path(STATE_FILE).read_text())
 
-    for p in DRONE:
-        vals = re.findall(p, t)
-        d += sum(int(x) for x in vals if str(x).isdigit())
+def save(data):
+    Path(STATE_FILE).write_text(json.dumps(data,indent=2,ensure_ascii=False))
 
-    return m, d
+# =========================
+# تشغيل
+# =========================
+db = load()
+keys = set(x["key"] for x in db)
 
-stats = {k: {"m": 0, "d": 0} for k in GULF}
-seen = set()
+now = datetime.utcnow()
+daily_cut = now - timedelta(hours=24)
 
 for url in RSS:
     feed = feedparser.parse(url)
 
     for e in feed.entries:
-        text = clean(getattr(e, "title", "") + " " + getattr(e, "summary", ""))
+        text = clean(e.title + " " + e.get("summary",""))
 
-        if not has_intercept(text):
-            continue
+        if not any(k in text.lower() for k in INTERCEPT): continue
+        if any(k in text.lower() for k in EXCLUDE): continue
 
-        if is_bad(text):
-            continue
+        c = detect_country(text)
+        if not c: continue
 
-        c = country(text)
-        if not c:
-            continue
+        m,d = extract(text)
+        if m==0 and d==0: continue
 
-        m, d = extract(text)
-        if m == 0 and d == 0:
-            continue
+        pub = datetime.utcnow()
 
-        key = hashlib.md5((c + "|" + text[:300]).encode("utf-8")).hexdigest()
-        if key in seen:
-            continue
-        seen.add(key)
+        key = hashlib.md5(text.encode()).hexdigest()
+        if key in keys: continue
+        keys.add(key)
 
-        stats[c]["m"] += m
-        stats[c]["d"] += d
+        db.append({
+            "key": key,
+            "country": c,
+            "m": m,
+            "d": d,
+            "time": pub.isoformat()
+        })
 
-today = datetime.now().strftime("%Y-%m-%d")
+# =========================
+# حساب
+# =========================
+daily = {k:{"m":0,"d":0} for k in GULF}
+total = {k:{"m":0,"d":0} for k in GULF}
 
-msg = f"""📊 اعتراض وصد الصواريخ والمسيّرات
-🕒 {today}
+for e in db:
+    t = datetime.fromisoformat(e["time"])
+    c = e["country"]
 
-"""
+    if t >= daily_cut:
+        daily[c]["m"] += e["m"]
+        daily[c]["d"] += e["d"]
 
-total_m = 0
-total_d = 0
+    if t >= START_DATE:
+        total[c]["m"] += e["m"]
+        total[c]["d"] += e["d"]
 
-for k, name in GULF.items():
-    m = stats[k]["m"]
-    d = stats[k]["d"]
+save(db)
 
-    total_m += m
-    total_d += d
+# =========================
+# تقرير
+# =========================
+msg = f"📊 التقرير اليومي\n🕒 {now.date()}\n\n"
 
-    msg += f"""{name}
-• الصواريخ: {m}
-• المسيّرات: {d}
+for k,n in GULF.items():
+    msg += f"{n}\n• 🚀 {daily[k]['m']} | 🛸 {daily[k]['d']}\n\n"
 
-"""
+msg += "════════════════════\n📊 منذ بداية الحرب\n\n"
 
-msg += f"""════════════════════
-📊 الإجمالي
-• الصواريخ: {total_m}
-• المسيّرات: {total_d}
-"""
+for k,n in GULF.items():
+    msg += f"{n}\n• 🚀 {total[k]['m']} | 🛸 {total[k]['d']}\n\n"
 
 send(msg)
